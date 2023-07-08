@@ -4,7 +4,13 @@ use parking_lot::RwLock;
 
 pub enum Continue<T> {
     Next(T),
+    Wait,
     Done,
+}
+#[derive(PartialEq)]
+pub enum Process {
+    Terminate,
+    Continue,
 }
 
 pub struct AsyncQueue<In, Out> {
@@ -14,7 +20,7 @@ impl<In: Send + Sync + 'static, Out: Send + Sync + 'static> AsyncQueue<In, Out> 
     pub fn new<P, F, C>(parallel_processes: usize, producer: P, function: F, consumer: C) -> Self 
     where   P: Fn() -> Continue<In> + Send + Sync + 'static,
             F: Fn(In) -> anyhow::Result<Out> + Send + Sync + 'static,
-            C: Fn(anyhow::Result<Out>) + Send + Sync + 'static,
+            C: Fn(anyhow::Result<Out>) -> Process + Send + Sync + 'static,
     {
         Self {
             runner: Arc::new(RwLock::new(
@@ -36,19 +42,19 @@ impl<In: Send + Sync + 'static, Out: Send + Sync + 'static> AsyncQueue<In, Out> 
 mod async_queue {
 
     use tokio::spawn;
+    use tokio::time::sleep;
     use parking_lot::RwLock;
-    use tokio::task::yield_now;
     use std::sync::Arc;
     use std::collections::VecDeque;
 
     use crate::processes;
     use crate::queue::Payload;
 
-    use super::Continue;
+    use super::{Continue, Process};
 
     type Producer<In>       = Arc<dyn Fn() -> Continue<In> + Send + Sync>;
     type Function<In, Out>  = Arc<dyn Fn(In) -> anyhow::Result<Out> + Send + Sync>;
-    type Consumer<Out>      = Arc<dyn Fn(anyhow::Result<Out>) + Send + Sync>;
+    type Consumer<Out>      = Arc<dyn Fn(anyhow::Result<Out>) -> Process + Send + Sync>;
 
     #[derive(Debug)]
     pub enum Index {
@@ -71,7 +77,7 @@ mod async_queue {
         pub fn new<P, F, C>(parallel_processes: usize, producer: P, function: F, consumer: C) -> Self 
         where   P: Fn() -> Continue<In> + Send + Sync + 'static,
                 F: Fn(In) -> anyhow::Result<Out> + Send + Sync + 'static,
-                C: Fn(anyhow::Result<Out>) + Send + Sync + 'static,
+                C: Fn(anyhow::Result<Out>) -> Process + Send + Sync + 'static,
         {
             Self {
                 parallel_processes,
@@ -89,13 +95,25 @@ mod async_queue {
             let max_processes = self.parallel_processes;
             let spawned_processes = processes::SpawnedProcessed::default();
 
+            let mut process = Process::Continue;
+
             loop {
-                yield_now().await;
+                // wait for one millisecond is more beneficial then yielding
+                sleep(std::time::Duration::from_millis(1)).await;
+
+                // terminate
+                if process == Process::Terminate {
+                    break
+                }
+
                 // producer
                 while spawned_processes.current() < max_processes {
                     match (self.producer)() {
                         Continue::Done => {
                             self.in_queue.write().push_back((Index::InActive, Continue::Done));
+                            break;
+                        }
+                        Continue::Wait => {
                             break;
                         }
                         continuation => {
@@ -131,15 +149,10 @@ mod async_queue {
                     }            
                     if can_read {
                         if let Some(Payload{ out: Continue::Next(out), ..}) = self.out_queue.write().pop() {
-                            (self.consumer)(out);
+                            process = (self.consumer)(out);
                             spawned_processes.dec();
                         }
                     }
-                }
-
-                // terminate
-                if spawned_processes.current() == 0 {
-                    break;
                 }
             }
 
